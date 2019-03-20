@@ -9,8 +9,9 @@ const browserify = require('browserify');
 const fs = require('fs');
 const path = require('path');
 const rimraf = require('rimraf');
+const assert = require('assert');
 
-const distDir = path.join(__dirname, '..', 'dist', 'dt-resources');
+const distDir = path.join(__dirname, '..', 'dist', 'dt-report-resources');
 const bundleOutFile = `${distDir}/report-generator.js`;
 const generatorFilename = `./lighthouse-core/report/report-generator.js`;
 const htmlReportAssets = require('../lighthouse-core/report/html/html-report-assets.js');
@@ -21,6 +22,7 @@ const htmlReportAssets = require('../lighthouse-core/report/html/html-report-ass
  * @param {string} content
  */
 function convertToAsciiAndWriteFile(name, content) {
+  assert(content);
   // eslint-disable-next-line no-control-regex
   const escaped = content.replace(/[^\x00-\x7F]/g, c => '\\\\u' + c.charCodeAt(0).toString(16));
   fs.writeFileSync(`${distDir}/${name}`, escaped);
