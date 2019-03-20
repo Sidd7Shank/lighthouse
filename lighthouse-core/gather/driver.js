@@ -69,18 +69,19 @@ class Driver {
      */
     this._monitoredUrl = null;
 
-    let targetProxyMessageId = 0;
-    this.on('Target.attachedToTarget', event => {
-      targetProxyMessageId++;
-      // We're only interested in network requests from iframes for now as those are "part of the page".
-      if (event.targetInfo.type !== 'iframe') return;
+    /**
+     * Used for sending messages to subtargets
+     * @type {number}
+     * @private
+     */
+    this._targetProxyMessageId = 0;
 
-      // We want to receive information about network requests from iframes, so enable the Network domain.
-      // Network events from subtargets will be stringified and sent back on `Target.receivedMessageFromTarget`.
-      this.sendCommand('Target.sendMessageToTarget', {
-        message: JSON.stringify({id: targetProxyMessageId, method: 'Network.enable'}),
-        sessionId: event.sessionId,
-      });
+    this.on('Target.attachedToTarget', event => {
+      this._handleTargetAttached(event, []);
+    });
+
+    this.on('Target.receivedMessageFromTarget', event => {
+      this._handleReceivedMessageFromTarget(event, []);
     });
 
     connection.on('protocolevent', event => {
@@ -273,6 +274,94 @@ class Driver {
    */
   setNextProtocolTimeout(timeout) {
     this._nextProtocolTimeout = timeout;
+  }
+
+  /**
+   * @param {LH.CrdpEvents['Target.receivedMessageFromTarget'][0]} event
+   * @param {string[]} parentSessionIds The list of session ids of the parents from oldest to youngest.
+   */
+  _handleReceivedMessageFromTarget(event, parentSessionIds) {
+    const {sessionId, message} = event;
+    /** @type {LH.Protocol.RawMessage} */
+    const protocolMessage = JSON.parse(message);
+
+    // Message was a response to some command, not an event, so we'll ignore it.
+    if ('id' in protocolMessage) return;
+
+    // We receive messages from the outermost subtarget which wraps the messages from the inner subtargets.
+    // We are recursively processing them from outside in, so build the list of parentSessionIds accordingly.
+    const sessionIds = parentSessionIds.concat([sessionId]);
+
+    if (protocolMessage.method === 'Target.receivedMessageFromTarget') {
+      // Unravel any messages from subtargets by recursively processing
+      this._handleReceivedMessageFromTarget(protocolMessage.params, sessionIds);
+    }
+
+    if (protocolMessage.method === 'Target.attachedToTarget') {
+      // Process any attachedToTarget messages from subtargets
+      this._handleTargetAttached(protocolMessage.params, sessionIds);
+    }
+
+    if (protocolMessage.method.startsWith('Network')) {
+      // Make sure the message gets added to our devtools log for replay later.
+      this._devtoolsLog.record(protocolMessage);
+      // Also dispatch the event to our status monitor for in-the-moment network quiet detection.
+      if (this._networkStatusMonitor) this._networkStatusMonitor.dispatch(protocolMessage);
+    }
+  }
+
+  /**
+   * @param {LH.CrdpEvents['Target.attachedToTarget'][0]} event
+   * @param {string[]} parentSessionIds The list of session ids of the parents from oldest to youngest.
+   */
+  _handleTargetAttached(event, parentSessionIds) {
+    // We're only interested in network requests from iframes for now as those are "part of the page".
+    if (event.targetInfo.type !== 'iframe') return;
+
+    const sessionIds = parentSessionIds.concat([event.sessionId]);
+    // Events from subtargets will be stringified and sent back on `Target.receivedMessageFromTarget`.
+    // We want to receive information about network requests from iframes, so enable the Network domain.
+    this.sendMessageToTarget(sessionIds, 'Network.enable');
+    this.sendMessageToTarget(sessionIds, 'Runtime.runIfWaitingForDebugger');
+    // We also want to receive information about subtargets of subtargets, so make sure we autoattach recursively.
+    this.sendMessageToTarget(sessionIds, 'Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: true,
+    });
+  }
+
+  /**
+   * Send protocol commands to a subtarget, wraps the message in as many `Target.sendMessageToTarget`
+   * commands as necessary.
+   *
+   * @template {keyof LH.CrdpCommands} C
+   * @param {string[]} sessionIds List of session ids to send to, from oldest-youngest/outside-in.
+   * @param {C} method
+   * @param {LH.CrdpCommands[C]['paramsType']} params
+   * @return {Promise<LH.CrdpCommands[C]['returnType']>}
+   */
+  sendMessageToTarget(sessionIds, method, ...params) {
+    const reversed = sessionIds.slice().reverse();
+    this._targetProxyMessageId++;
+    /** @type {LH.CrdpCommands['Target.sendMessageToTarget']['paramsType'][0]} */
+    let payload = {
+      sessionId: reversed[0],
+      message: JSON.stringify({id: this._targetProxyMessageId, method, params: params[0]}),
+    };
+
+    for (const sessionId of reversed.slice(1)) {
+      this._targetProxyMessageId++;
+      payload = {
+        sessionId,
+        message: JSON.stringify({
+          id: this._targetProxyMessageId,
+          method: 'Target.sendMessageToTarget',
+          params: payload,
+        }),
+      };
+    }
+
+    return this.sendCommand('Target.sendMessageToTarget', payload);
   }
 
   /**
@@ -1044,7 +1133,7 @@ class Driver {
     // Enable auto-attaching to subtargets so we receive iframe information
     await this.sendCommand('Target.setAutoAttach', {
       autoAttach: true,
-      waitForDebuggerOnStart: false,
+      waitForDebuggerOnStart: true,
     });
 
     await this.sendCommand('Page.enable');
